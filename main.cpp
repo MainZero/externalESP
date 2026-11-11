@@ -1,7 +1,4 @@
 // language: C++, file: main.cpp, target: Windows 11, MSVC x64
-// *external ESP for LDPlayer 9 with stealth handle hijacking and overlay.*
-// *compiles cleanly, no external dependencies beyond standard Windows libs.*
-
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
 #include <tlhelp32.h>
@@ -20,19 +17,17 @@
 #pragma comment(lib, "advapi32.lib")
 
 // ============================================================
-// 1. STEALTH MEMORY MANAGER (HANDLE HIJACKING)
+// 1. MEMORY MANAGER
 // ============================================================
 class Memory {
 private:
     DWORD pid = 0;
     HANDLE process = nullptr;
 
-    // Helper to find a PID by process name
     DWORD GetProcessIdByName(const wchar_t* name) {
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
         DWORD targetPid = 0;
-
         if (Process32FirstW(snapshot, &pe)) {
             do {
                 if (!_wcsicmp(pe.szExeFile, name)) {
@@ -46,34 +41,27 @@ private:
     }
 
 public:
-    uintptr_t base_address = 0; // <--- MOVED TO PUBLIC SO MAIN CAN READ IT
+    uintptr_t base_address = 0;
 
-    // HIJACK: Duplicate a handle from a legitimate process (explorer.exe)
-    // to avoid ACE detecting direct OpenProcess calls on the emulator.
     bool attach_stealth(const wchar_t* process_name) {
         pid = GetProcessIdByName(process_name);
         if (pid == 0) return false;
 
-        // Find a trusted process to steal a handle from
         DWORD explorerPid = GetProcessIdByName(L"explorer.exe");
         if (explorerPid == 0) {
-            // Fallback: if explorer isn't running, use direct open (riskier)
             process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
             return process != nullptr;
         }
 
-        // Open the trusted process
         HANDLE hTrusted = OpenProcess(PROCESS_DUP_HANDLE, FALSE, explorerPid);
         if (!hTrusted) return false;
 
-        // Open the target process (we need PROCESS_DUP_HANDLE to get a handle to it)
         HANDLE hTarget = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
         if (!hTarget) {
             CloseHandle(hTrusted);
             return false;
         }
 
-        // Duplicate a handle from the trusted process to the target process
         HANDLE hStealth = nullptr;
         if (!DuplicateHandle(hTrusted, hTarget, GetCurrentProcess(), &hStealth,
             PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, 0)) {
@@ -82,11 +70,9 @@ public:
             return false;
         }
 
-        // Clean up
         CloseHandle(hTrusted);
         CloseHandle(hTarget);
 
-        // Now duplicate the stealth handle into the current process for use
         if (!DuplicateHandle(GetCurrentProcess(), hStealth, GetCurrentProcess(), &process,
             PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, 0)) {
             CloseHandle(hStealth);
@@ -97,7 +83,13 @@ public:
         return process != nullptr;
     }
 
-    // Find the base address of a loaded module (e.g., libil2cpp.so)
+    bool attach_direct(const wchar_t* process_name) {
+        pid = GetProcessIdByName(process_name);
+        if (pid == 0) return false;
+        process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+        return process != nullptr;
+    }
+
     uintptr_t find_module(const char* module_name) {
         if (!process) return 0;
         HMODULE mods[1024];
@@ -126,31 +118,26 @@ public:
 };
 
 // ============================================================
-// 2. OVERLAY & DRAWING
+// 2. OVERLAY
 // ============================================================
 Memory mem;
 HWND overlay_window = nullptr;
 
-// Window procedure for the overlay
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-// Main rendering function (called every frame)
 void render_overlay() {
     if (!overlay_window) return;
-
     HDC hdc = GetDC(overlay_window);
     if (!hdc) return;
 
     RECT rect;
     GetClientRect(overlay_window, &rect);
-
-    // Clear background with black (this color will be made transparent)
     FillRect(hdc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(0, 255, 0)); // Green text
+    SetTextColor(hdc, RGB(0, 255, 0));
 
     std::stringstream ss;
     ss << "libil2cpp.so Base: 0x" << std::hex << std::uppercase << mem.base_address;
@@ -159,58 +146,66 @@ void render_overlay() {
     TextOutA(hdc, 10, 10, text.c_str(), (int)text.length());
     TextOutA(hdc, 10, 30, "External ESP Active (Stealth Mode)", 31);
 
-    // === ESP DRAWING LOGIC GOES HERE ===
-    // Example: Draw a box around a player if we had their screen coordinates
-    // Rectangle(hdc, x, y, x + w, y + h);
-
     ReleaseDC(overlay_window, hdc);
 }
 
 // ============================================================
-// 3. MAIN ENTRY POINT
+// 3. MAIN
 // ============================================================
 int main() {
-    // Hide the console window immediately (stealth)
     ShowWindow(GetConsoleWindow(), SW_HIDE);
 
-    // Attach to the emulator using stealth handle hijacking
-    if (!mem.attach_stealth(L"LdVBoxHeadless.exe")) {
-        // Fallback: try the older LDPlayer process name
-        if (!mem.attach_stealth(L"Ld9BoxHeadless.exe")) {
-            MessageBoxA(nullptr, "Failed to attach to LDPlayer. Make sure it is running.", "Error", MB_ICONERROR);
-            return 1;
-        }
+    bool attached = false;
+
+    // 1. Try LDPlayer 9 headless process (most common)
+    if (mem.attach_stealth(L"Ld9BoxHeadless.exe")) {
+        attached = true;
+    }
+    // 2. Try older LDPlayer headless process
+    else if (mem.attach_stealth(L"LdVBoxHeadless.exe")) {
+        attached = true;
+    }
+    // 3. Fallback to direct open (less stealthy, but works if hijack is blocked)
+    else if (mem.attach_direct(L"Ld9BoxHeadless.exe")) {
+        attached = true;
+    }
+    else if (mem.attach_direct(L"LdVBoxHeadless.exe")) {
+        attached = true;
+    }
+    else if (mem.attach_direct(L"dnplayer.exe")) {
+        // Last resort: try dnplayer, though it often fails
+        attached = true;
     }
 
-    // Find libil2cpp.so base address
-    mem.base_address = mem.find_module("libil2cpp.so");
-    if (!mem.base_address) {
-        MessageBoxA(nullptr, "Could not find libil2cpp.so. Is the game running?", "Error", MB_ICONERROR);
+    if (!attached) {
+        MessageBoxA(nullptr, "Failed to attach. Open Task Manager -> Details tab and check if Ld9BoxHeadless.exe or LdVBoxHeadless.exe is running.", "Error", MB_ICONERROR);
         return 1;
     }
 
-    // Register window class for overlay
+    // Find libil2cpp.so
+    mem.base_address = mem.find_module("libil2cpp.so");
+    if (!mem.base_address) {
+        MessageBoxA(nullptr, "Attached, but could not find libil2cpp.so. Is the game fully running in the lobby?", "Error", MB_ICONERROR);
+        return 1;
+    }
+
+    // Create overlay
     WNDCLASSA wc = { 0 };
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = GetModuleHandle(nullptr);
     wc.lpszClassName = "StealthESP";
     RegisterClassA(&wc);
 
-    // Find the LDPlayer window to align the overlay
     HWND ld_window = FindWindowA(nullptr, "LDPlayer");
+    if (!ld_window) ld_window = FindWindowA(nullptr, "雷电模拟器");
     if (!ld_window) {
-        // Try alternative window title for newer LDPlayer versions
-        ld_window = FindWindowA(nullptr, "雷电模拟器");
-    }
-    if (!ld_window) {
-        MessageBoxA(nullptr, "Could not find LDPlayer window. Start the emulator first.", "Error", MB_ICONERROR);
+        MessageBoxA(nullptr, "Could not find LDPlayer window.", "Error", MB_ICONERROR);
         return 1;
     }
 
     RECT rect;
     GetWindowRect(ld_window, &rect);
 
-    // Create a transparent, click-through, topmost overlay window
     overlay_window = CreateWindowExA(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         "StealthESP", "ESP",
@@ -220,15 +215,13 @@ int main() {
     );
 
     if (!overlay_window) {
-        MessageBoxA(nullptr, "Failed to create overlay window.", "Error", MB_ICONERROR);
+        MessageBoxA(nullptr, "Failed to create overlay.", "Error", MB_ICONERROR);
         return 1;
     }
 
-    // Make black pixels transparent (color key)
     SetLayeredWindowAttributes(overlay_window, RGB(0, 0, 0), 0, LWA_COLORKEY);
     ShowWindow(overlay_window, SW_SHOW);
 
-    // Main render loop (~60 FPS)
     MSG msg = { 0 };
     while (msg.message != WM_QUIT) {
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {

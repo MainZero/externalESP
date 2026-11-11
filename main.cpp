@@ -1,5 +1,5 @@
 // language: C++, file: main.cpp, target: Windows 11, MSVC x64
-// *external ESP for LDPlayer 9 with stealth attachment, ELF memory scanning, and flicker-free overlay.*
+// *external ESP for LDPlayer 9 with stealth attachment, ELF memory scanning, and overlay.*
 // *compiles cleanly, no external dependencies beyond standard Windows libs.*
 
 #define _WIN32_WINNT 0x0601
@@ -18,6 +18,11 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
+
+// Define a macro for all standard readable memory protections
+#ifndef PAGE_READABLE
+#define PAGE_READABLE (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+#endif
 
 // ============================================================
 // 1. MEMORY MANAGER (Stealth + ELF Scanner)
@@ -93,7 +98,7 @@ public:
         return process != nullptr;
     }
 
-    // Scans memory for the Android ELF header and the module name (Reads 64KB to guarantee we find the string)
+    // Scans memory for the Android ELF header and the module name
     uintptr_t find_module_elf(const char* module_name) {
         if (!process) return 0;
 
@@ -101,13 +106,16 @@ public:
         uintptr_t address = 0;
         
         while (VirtualQueryEx(process, (LPCVOID)address, &mbi, sizeof(mbi))) {
-            if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READABLE)) {
+            // Ensure memory is committed, readable, and not guarded (avoids access violations)
+            if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READABLE) && !(mbi.Protect & PAGE_GUARD)) {
                 size_t read_size = (mbi.RegionSize < 0x10000) ? mbi.RegionSize : 0x10000;
                 std::vector<BYTE> buffer(read_size);
                 SIZE_T bytes_read = 0;
                 
                 if (ReadProcessMemory(process, mbi.BaseAddress, buffer.data(), read_size, &bytes_read) && bytes_read > 4) {
+                    // Check for ELF magic header (0x7F 'E' 'L' 'F')
                     if (buffer[0] == 0x7F && buffer[1] == 'E' && buffer[2] == 'L' && buffer[3] == 'F') {
+                        // Check if the module name exists in the first 64KB
                         std::string haystack((char*)buffer.data(), bytes_read);
                         if (haystack.find(module_name) != std::string::npos) {
                             return (uintptr_t)mbi.BaseAddress;
@@ -131,7 +139,7 @@ public:
 };
 
 // ============================================================
-// 2. OVERLAY & DRAWING (Double-Buffered for No Flicker)
+// 2. OVERLAY & DRAWING (Double-Buffered)
 // ============================================================
 Memory mem;
 HWND overlay_window = nullptr;
@@ -236,7 +244,7 @@ int main() {
             DispatchMessage(&msg);
         }
 
-        // Auto-align overlay exactly to the game screen (ignoring LDPlayer's UI borders)
+        // Auto-align overlay exactly to the game screen
         if (IsWindow(ld_window) && IsWindowVisible(ld_window)) {
             RECT clientRect;
             GetClientRect(ld_window, &clientRect);

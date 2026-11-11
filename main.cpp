@@ -1,5 +1,5 @@
 // language: C++, file: main.cpp, target: Windows 11, MSVC x64
-// *external ESP for LDPlayer 9 with stealth attachment, ELF memory scanning, and overlay.*
+// *external ESP for LDPlayer 9. uses string-based base address calculation to bypass ACE header wiping.*
 // *compiles cleanly, no external dependencies beyond standard Windows libs.*
 
 #define _WIN32_WINNT 0x0601
@@ -19,13 +19,12 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
 
-// Define a macro for all standard readable memory protections
 #ifndef PAGE_READABLE
 #define PAGE_READABLE (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
 #endif
 
 // ============================================================
-// 1. MEMORY MANAGER (Stealth + ELF Scanner)
+// 1. MEMORY MANAGER (String-Based Base Finder)
 // ============================================================
 class Memory {
 private:
@@ -98,28 +97,28 @@ public:
         return process != nullptr;
     }
 
-    // Scans memory for the Android ELF header and the module name
-    uintptr_t find_module_elf(const char* module_name) {
+    // Scans memory for the string "libil2cpp.so" and calculates the base address
+    uintptr_t find_module_by_string(const char* module_name) {
         if (!process) return 0;
 
         MEMORY_BASIC_INFORMATION mbi;
         uintptr_t address = 0;
-        
+
         while (VirtualQueryEx(process, (LPCVOID)address, &mbi, sizeof(mbi))) {
-            // Ensure memory is committed, readable, and not guarded (avoids access violations)
             if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READABLE) && !(mbi.Protect & PAGE_GUARD)) {
                 size_t read_size = (mbi.RegionSize < 0x10000) ? mbi.RegionSize : 0x10000;
                 std::vector<BYTE> buffer(read_size);
                 SIZE_T bytes_read = 0;
                 
-                if (ReadProcessMemory(process, mbi.BaseAddress, buffer.data(), read_size, &bytes_read) && bytes_read > 4) {
-                    // Check for ELF magic header (0x7F 'E' 'L' 'F')
-                    if (buffer[0] == 0x7F && buffer[1] == 'E' && buffer[2] == 'L' && buffer[3] == 'F') {
-                        // Check if the module name exists in the first 64KB
-                        std::string haystack((char*)buffer.data(), bytes_read);
-                        if (haystack.find(module_name) != std::string::npos) {
-                            return (uintptr_t)mbi.BaseAddress;
-                        }
+                if (ReadProcessMemory(process, mbi.BaseAddress, buffer.data(), read_size, &bytes_read) && bytes_read > 0) {
+                    std::string haystack((char*)buffer.data(), bytes_read);
+                    size_t pos = haystack.find(module_name);
+                    
+                    if (pos != std::string::npos) {
+                        // We found the string. Now we calculate the base address.
+                        // Android modules are mapped in 0x1000 page alignments. 
+                        // The string is usually inside the AllocationBase of the module.
+                        return (uintptr_t)mbi.AllocationBase;
                     }
                 }
             }
@@ -139,7 +138,7 @@ public:
 };
 
 // ============================================================
-// 2. OVERLAY & DRAWING (Double-Buffered)
+// 2. OVERLAY & DRAWING
 // ============================================================
 Memory mem;
 HWND overlay_window = nullptr;
@@ -161,15 +160,11 @@ void render_overlay() {
     int width = rect.right - rect.left;
     int height = rect.bottom - rect.top;
 
-    // Double Buffering (Prevents flickering)
     HDC memDC = CreateCompatibleDC(hdc);
     HBITMAP memBitmap = CreateCompatibleBitmap(hdc, width, height);
     HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
 
-    // Clear background with black (transparent color key)
     FillRect(memDC, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
-    
-    // Draw Text
     SetBkMode(memDC, TRANSPARENT);
     SetTextColor(memDC, RGB(0, 255, 0));
     
@@ -178,12 +173,10 @@ void render_overlay() {
     std::string text = ss.str();
 
     TextOutA(memDC, 10, 10, text.c_str(), (int)text.length());
-    TextOutA(memDC, 10, 30, "External ESP Active (Double-Buffered)", 37);
+    TextOutA(memDC, 10, 30, "External ESP Active (String Scan)", 33);
 
-    // Push to screen
     BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
 
-    // Cleanup
     SelectObject(memDC, oldBitmap);
     DeleteObject(memBitmap);
     DeleteDC(memDC);
@@ -207,9 +200,11 @@ int main() {
         return 1;
     }
 
-    mem.base_address = mem.find_module_elf("libil2cpp.so");
+    // Use the new string-based scanner
+    mem.base_address = mem.find_module_by_string("libil2cpp.so");
+    
     if (!mem.base_address) {
-        MessageBoxA(nullptr, "Could not find libil2cpp.so. Is the game in the lobby?", "Module Not Found", MB_ICONERROR);
+        MessageBoxA(nullptr, "Could not find libil2cpp.so string in memory. Is the game fully loaded?", "Module Not Found", MB_ICONERROR);
         return 1;
     }
 
@@ -230,7 +225,7 @@ int main() {
     overlay_window = CreateWindowExA(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
         "StealthESP", "ESP", WS_POPUP,
-        0, 0, 100, 100, // Initial size, auto-aligned in loop
+        0, 0, 100, 100,
         nullptr, nullptr, wc.hInstance, nullptr
     );
 
@@ -244,7 +239,6 @@ int main() {
             DispatchMessage(&msg);
         }
 
-        // Auto-align overlay exactly to the game screen
         if (IsWindow(ld_window) && IsWindowVisible(ld_window)) {
             RECT clientRect;
             GetClientRect(ld_window, &clientRect);
@@ -258,7 +252,7 @@ int main() {
         }
 
         render_overlay();
-        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS
+        std::this_thread::sleep_for(std::chrono::milliseconds(16)); 
     }
 
     return 0;

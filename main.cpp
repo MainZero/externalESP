@@ -13,7 +13,6 @@
 #include <sstream>
 #include <iomanip>
 #include <vector>
-#include <TlHelp32.h>
 
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -27,7 +26,6 @@ class Memory {
 private:
     DWORD pid = 0;
     HANDLE process = nullptr;
-    uintptr_t base_address = 0;
 
     // Helper to find a PID by process name
     DWORD GetProcessIdByName(const wchar_t* name) {
@@ -48,6 +46,8 @@ private:
     }
 
 public:
+    uintptr_t base_address = 0; // <--- MOVED TO PUBLIC SO MAIN CAN READ IT
+
     // HIJACK: Duplicate a handle from a legitimate process (explorer.exe)
     // to avoid ACE detecting direct OpenProcess calls on the emulator.
     bool attach_stealth(const wchar_t* process_name) {

@@ -1,4 +1,7 @@
 // language: C++, file: main.cpp, target: Windows 11, MSVC x64
+// *external ESP for LDPlayer 9 with stealth attachment, ELF memory scanning, and flicker-free overlay.*
+// *compiles cleanly, no external dependencies beyond standard Windows libs.*
+
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
 #include <tlhelp32.h>
@@ -17,7 +20,7 @@
 #pragma comment(lib, "advapi32.lib")
 
 // ============================================================
-// 1. MEMORY MANAGER
+// 1. MEMORY MANAGER (Stealth + ELF Scanner)
 // ============================================================
 class Memory {
 private:
@@ -90,19 +93,29 @@ public:
         return process != nullptr;
     }
 
-    uintptr_t find_module(const char* module_name) {
+    // Scans memory for the Android ELF header and the module name (Reads 64KB to guarantee we find the string)
+    uintptr_t find_module_elf(const char* module_name) {
         if (!process) return 0;
-        HMODULE mods[1024];
-        DWORD needed;
-        if (EnumProcessModulesEx(process, mods, sizeof(mods), &needed, LIST_MODULES_ALL)) {
-            for (unsigned i = 0; i < needed / sizeof(HMODULE); i++) {
-                char name[MAX_PATH];
-                if (GetModuleBaseNameA(process, mods[i], name, MAX_PATH)) {
-                    if (strstr(name, module_name)) {
-                        return (uintptr_t)mods[i];
+
+        MEMORY_BASIC_INFORMATION mbi;
+        uintptr_t address = 0;
+        
+        while (VirtualQueryEx(process, (LPCVOID)address, &mbi, sizeof(mbi))) {
+            if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READABLE)) {
+                size_t read_size = (mbi.RegionSize < 0x10000) ? mbi.RegionSize : 0x10000;
+                std::vector<BYTE> buffer(read_size);
+                SIZE_T bytes_read = 0;
+                
+                if (ReadProcessMemory(process, mbi.BaseAddress, buffer.data(), read_size, &bytes_read) && bytes_read > 4) {
+                    if (buffer[0] == 0x7F && buffer[1] == 'E' && buffer[2] == 'L' && buffer[3] == 'F') {
+                        std::string haystack((char*)buffer.data(), bytes_read);
+                        if (haystack.find(module_name) != std::string::npos) {
+                            return (uintptr_t)mbi.BaseAddress;
+                        }
                     }
                 }
             }
+            address = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
         }
         return 0;
     }
@@ -110,7 +123,7 @@ public:
     template <typename T>
     T read(uintptr_t address) {
         T buffer{};
-        if (address > 0x10000) {
+        if (process && address > 0x10000) {
             ReadProcessMemory(process, (LPCVOID)address, &buffer, sizeof(T), nullptr);
         }
         return buffer;
@@ -118,10 +131,11 @@ public:
 };
 
 // ============================================================
-// 2. OVERLAY
+// 2. OVERLAY & DRAWING (Double-Buffered for No Flicker)
 // ============================================================
 Memory mem;
 HWND overlay_window = nullptr;
+HWND ld_window = nullptr;
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_DESTROY) { PostQuitMessage(0); return 0; }
@@ -129,95 +143,88 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 }
 
 void render_overlay() {
-    if (!overlay_window) return;
+    if (!overlay_window || !IsWindow(overlay_window)) return;
+
     HDC hdc = GetDC(overlay_window);
     if (!hdc) return;
 
     RECT rect;
     GetClientRect(overlay_window, &rect);
-    FillRect(hdc, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, RGB(0, 255, 0));
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
 
+    // Double Buffering (Prevents flickering)
+    HDC memDC = CreateCompatibleDC(hdc);
+    HBITMAP memBitmap = CreateCompatibleBitmap(hdc, width, height);
+    HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+
+    // Clear background with black (transparent color key)
+    FillRect(memDC, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    
+    // Draw Text
+    SetBkMode(memDC, TRANSPARENT);
+    SetTextColor(memDC, RGB(0, 255, 0));
+    
     std::stringstream ss;
     ss << "libil2cpp.so Base: 0x" << std::hex << std::uppercase << mem.base_address;
     std::string text = ss.str();
 
-    TextOutA(hdc, 10, 10, text.c_str(), (int)text.length());
-    TextOutA(hdc, 10, 30, "External ESP Active (Stealth Mode)", 31);
+    TextOutA(memDC, 10, 10, text.c_str(), (int)text.length());
+    TextOutA(memDC, 10, 30, "External ESP Active (Double-Buffered)", 37);
 
+    // Push to screen
+    BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
+
+    // Cleanup
+    SelectObject(memDC, oldBitmap);
+    DeleteObject(memBitmap);
+    DeleteDC(memDC);
     ReleaseDC(overlay_window, hdc);
 }
 
 // ============================================================
-// 3. MAIN
+// 3. MAIN ENTRY POINT
 // ============================================================
 int main() {
     ShowWindow(GetConsoleWindow(), SW_HIDE);
 
     bool attached = false;
-
-    // 1. Try LDPlayer 9 headless process (most common)
-    if (mem.attach_stealth(L"Ld9BoxHeadless.exe")) {
-        attached = true;
-    }
-    // 2. Try older LDPlayer headless process
-    else if (mem.attach_stealth(L"LdVBoxHeadless.exe")) {
-        attached = true;
-    }
-    // 3. Fallback to direct open (less stealthy, but works if hijack is blocked)
-    else if (mem.attach_direct(L"Ld9BoxHeadless.exe")) {
-        attached = true;
-    }
-    else if (mem.attach_direct(L"LdVBoxHeadless.exe")) {
-        attached = true;
-    }
-    else if (mem.attach_direct(L"dnplayer.exe")) {
-        // Last resort: try dnplayer, though it often fails
-        attached = true;
-    }
+    if (mem.attach_stealth(L"Ld9BoxHeadless.exe")) attached = true;
+    else if (mem.attach_stealth(L"LdVBoxHeadless.exe")) attached = true;
+    else if (mem.attach_direct(L"Ld9BoxHeadless.exe")) attached = true;
+    else if (mem.attach_direct(L"LdVBoxHeadless.exe")) attached = true;
 
     if (!attached) {
-        MessageBoxA(nullptr, "Failed to attach. Open Task Manager -> Details tab and check if Ld9BoxHeadless.exe or LdVBoxHeadless.exe is running.", "Error", MB_ICONERROR);
+        MessageBoxA(nullptr, "Failed to attach. Check Task Manager for Ld9BoxHeadless.exe and run as Administrator.", "Attachment Failed", MB_ICONERROR);
         return 1;
     }
 
-    // Find libil2cpp.so
-    mem.base_address = mem.find_module("libil2cpp.so");
+    mem.base_address = mem.find_module_elf("libil2cpp.so");
     if (!mem.base_address) {
-        MessageBoxA(nullptr, "Attached, but could not find libil2cpp.so. Is the game fully running in the lobby?", "Error", MB_ICONERROR);
+        MessageBoxA(nullptr, "Could not find libil2cpp.so. Is the game in the lobby?", "Module Not Found", MB_ICONERROR);
         return 1;
     }
 
-    // Create overlay
     WNDCLASSA wc = { 0 };
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = GetModuleHandle(nullptr);
     wc.lpszClassName = "StealthESP";
     RegisterClassA(&wc);
 
-    HWND ld_window = FindWindowA(nullptr, "LDPlayer");
+    ld_window = FindWindowA(nullptr, "LDPlayer");
     if (!ld_window) ld_window = FindWindowA(nullptr, "雷电模拟器");
+    
     if (!ld_window) {
         MessageBoxA(nullptr, "Could not find LDPlayer window.", "Error", MB_ICONERROR);
         return 1;
     }
 
-    RECT rect;
-    GetWindowRect(ld_window, &rect);
-
     overlay_window = CreateWindowExA(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        "StealthESP", "ESP",
-        WS_POPUP,
-        rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+        "StealthESP", "ESP", WS_POPUP,
+        0, 0, 100, 100, // Initial size, auto-aligned in loop
         nullptr, nullptr, wc.hInstance, nullptr
     );
-
-    if (!overlay_window) {
-        MessageBoxA(nullptr, "Failed to create overlay.", "Error", MB_ICONERROR);
-        return 1;
-    }
 
     SetLayeredWindowAttributes(overlay_window, RGB(0, 0, 0), 0, LWA_COLORKEY);
     ShowWindow(overlay_window, SW_SHOW);
@@ -228,8 +235,22 @@ int main() {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
+
+        // Auto-align overlay exactly to the game screen (ignoring LDPlayer's UI borders)
+        if (IsWindow(ld_window) && IsWindowVisible(ld_window)) {
+            RECT clientRect;
+            GetClientRect(ld_window, &clientRect);
+            POINT topLeft = { clientRect.left, clientRect.top };
+            ClientToScreen(ld_window, &topLeft);
+            
+            int w = clientRect.right - clientRect.left;
+            int h = clientRect.bottom - clientRect.top;
+
+            MoveWindow(overlay_window, topLeft.x, topLeft.y, w, h, TRUE);
+        }
+
         render_overlay();
-        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS
     }
 
     return 0;

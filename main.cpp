@@ -1,5 +1,5 @@
 // language: C++, file: main.cpp, target: Windows 11, MSVC x64
-// *external ESP matrix tester with SeDebugPrivilege elevation and PID-based window finding.*
+// *external ESP matrix tester with WorldToScreen math.*
 
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
@@ -19,12 +19,40 @@
 #pragma comment(lib, "advapi32.lib")
 
 // ============================================================
-// PUT YOUR ADDRESS HERE (e.g., 0x263DC844)
+// PUT YOUR MATRIX ADDRESS HERE
 // ============================================================
-uintptr_t TEST_MATRIX_ADDRESS = 0x263DC844; // <--- CHANGE THIS
+uintptr_t TEST_MATRIX_ADDRESS = 0x263DC844; // <--- CHANGE THIS TO YOUR ADDRESS
 
 // ============================================================
-// 1. PRIVILEGE ESCALATION
+// MATH STRUCTS
+// ============================================================
+struct Vec3 { float x, y, z; };
+struct Vec2 { float x, y; };
+struct Matrix4x4 { float m[4][4]; };
+
+// World to Screen Math
+bool WorldToScreen(Vec3 pos, Vec2& screen, float matrix[16], int windowWidth, int windowHeight) {
+    // Multiply the 3D vector by the Matrix
+    float clipX = pos.x * matrix[0] + pos.y * matrix[4] + pos.z * matrix[8] + matrix[12];
+    float clipY = pos.x * matrix[1] + pos.y * matrix[5] + pos.z * matrix[9] + matrix[13];
+    float clipW = pos.x * matrix[3] + pos.y * matrix[7] + pos.z * matrix[11] + matrix[15];
+
+    // If W is less than 0.1, the point is behind the camera
+    if (clipW < 0.1f) return false;
+
+    // Convert to Normalized Device Coordinates (NDC)
+    float ndcX = clipX / clipW;
+    float ndcY = clipY / clipW;
+
+    // Convert to Screen Coordinates
+    screen.x = (windowWidth / 2.0f) * (ndcX + 1.0f);
+    screen.y = (windowHeight / 2.0f) * (1.0f - ndcY); // Y is inverted
+
+    return true;
+}
+
+// ============================================================
+// PRIVILEGE ESCALATION
 // ============================================================
 bool EnableDebugPrivilege() {
     HANDLE hToken;
@@ -47,13 +75,12 @@ bool EnableDebugPrivilege() {
         CloseHandle(hToken);
         return false;
     }
-
     CloseHandle(hToken);
     return GetLastError() == ERROR_SUCCESS;
 }
 
 // ============================================================
-// 2. MEMORY MANAGER
+// MEMORY MANAGER
 // ============================================================
 class Memory {
 private:
@@ -90,7 +117,7 @@ public:
 };
 
 // ============================================================
-// 3. WINDOW FINDER (PID BASED)
+// WINDOW FINDER (PID BASED)
 // ============================================================
 struct WindowData {
     DWORD targetPid;
@@ -101,20 +128,16 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     WindowData* data = (WindowData*)lParam;
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    
     if (pid == data->targetPid && IsWindowVisible(hwnd)) {
-        // Check if it has a title (filters out invisible background windows)
-        int length = GetWindowTextLengthA(hwnd);
-        if (length > 0) {
+        if (GetWindowTextLengthA(hwnd) > 0) {
             data->hwnd = hwnd;
-            return FALSE; // Stop enumerating
+            return FALSE;
         }
     }
     return TRUE;
 }
 
 HWND GetEmulatorWindow() {
-    // Find the PID of dnplayer.exe (the UI process)
     DWORD uiPid = 0;
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
@@ -127,21 +150,19 @@ HWND GetEmulatorWindow() {
         } while (Process32NextW(snapshot, &pe));
     }
     CloseHandle(snapshot);
-
     if (uiPid == 0) return nullptr;
-
     WindowData data = { uiPid, nullptr };
     EnumWindows(EnumWindowsProc, (LPARAM)&data);
     return data.hwnd;
 }
 
 // ============================================================
-// 4. GLOBAL VARIABLES & OVERLAY
+// GLOBALS & RENDER
 // ============================================================
 Memory mem;
 HWND overlay_window = nullptr;
 HWND ld_window = nullptr;
-float matrix[16];
+float viewMatrix[16];
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_DESTROY) { PostQuitMessage(0); return 0; }
@@ -150,7 +171,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
 void update_game_data() {
     for (int i = 0; i < 16; i++) {
-        matrix[i] = mem.read<float>(TEST_MATRIX_ADDRESS + (i * 4));
+        viewMatrix[i] = mem.read<float>(TEST_MATRIX_ADDRESS + (i * 4));
     }
 }
 
@@ -171,16 +192,29 @@ void render_overlay() {
     FillRect(memDC, &rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
     SetBkMode(memDC, TRANSPARENT);
     SetTextColor(memDC, RGB(0, 255, 0));
+
+    // TEST: Project the world origin (0,0,0) to the screen
+    Vec3 worldOrigin = { 0.0f, 0.0f, 0.0f };
+    Vec2 screenPos;
     
-    std::stringstream ss;
-    for (int row = 0; row < 4; row++) {
-        ss << "[" << std::fixed << std::setw(8) << std::setprecision(2) << matrix[row * 4 + 0] << "  "
-           << std::setw(8) << matrix[row * 4 + 1] << "  "
-           << std::setw(8) << matrix[row * 4 + 2] << "  "
-           << std::setw(8) << matrix[row * 4 + 3] << "]\n";
+    if (WorldToScreen(worldOrigin, screenPos, viewMatrix, width, height)) {
+        // Draw a circle at the projected screen position
+        HPEN pen = CreatePen(PS_SOLID, 2, RGB(0, 255, 0));
+        HGDIOBJ oldPen = SelectObject(memDC, pen);
+        HGDIOBJ oldBrush = SelectObject(memDC, GetStockObject(NULL_BRUSH));
+        
+        Ellipse(memDC, (int)screenPos.x - 10, (int)screenPos.y - 10, (int)screenPos.x + 10, (int)screenPos.y + 10);
+        
+        SelectObject(memDC, oldPen);
+        SelectObject(memDC, oldBrush);
+        DeleteObject(pen);
+
+        // Draw text next to it
+        std::stringstream ss;
+        ss << "World Origin (0,0,0)";
+        TextOutA(memDC, (int)screenPos.x + 15, (int)screenPos.y - 10, ss.str().c_str(), (int)ss.str().length());
     }
-    
-    TextOutA(memDC, 10, 10, ss.str().c_str(), (int)ss.str().length());
+
     BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
 
     SelectObject(memDC, oldBitmap);
@@ -189,9 +223,6 @@ void render_overlay() {
     ReleaseDC(overlay_window, hdc);
 }
 
-// ============================================================
-// 5. MAIN
-// ============================================================
 int main() {
     ShowWindow(GetConsoleWindow(), SW_HIDE);
 
@@ -205,7 +236,7 @@ int main() {
     else if (mem.attach_direct(L"LdVBoxHeadless.exe")) attached = true;
 
     if (!attached) {
-        MessageBoxA(nullptr, "Failed to attach to LDPlayer memory. Is it running?", "Error", MB_ICONERROR);
+        MessageBoxA(nullptr, "Failed to attach to LDPlayer memory.", "Error", MB_ICONERROR);
         return 1;
     }
 
@@ -215,11 +246,9 @@ int main() {
     wc.lpszClassName = "StealthESP";
     RegisterClassA(&wc);
 
-    // Use the new PID-based window finder
     ld_window = GetEmulatorWindow();
-    
     if (!ld_window) {
-        MessageBoxA(nullptr, "Attached to memory, but could not find the LDPlayer window.\nMake sure it is not minimized.", "Error", MB_ICONERROR);
+        MessageBoxA(nullptr, "Could not find LDPlayer window.", "Error", MB_ICONERROR);
         return 1;
     }
 

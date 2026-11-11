@@ -1,5 +1,5 @@
 // language: C++, file: main.cpp, target: Windows 11, MSVC x64
-// *external ESP matrix tester with SeDebugPrivilege elevation and detailed error reporting.*
+// *external ESP matrix tester with SeDebugPrivilege elevation and PID-based window finding.*
 
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
@@ -24,7 +24,7 @@
 uintptr_t TEST_MATRIX_ADDRESS = 0x263DC844; // <--- CHANGE THIS
 
 // ============================================================
-// 1. PRIVILEGE ESCALATION (THE FIX)
+// 1. PRIVILEGE ESCALATION
 // ============================================================
 bool EnableDebugPrivilege() {
     HANDLE hToken;
@@ -75,8 +75,6 @@ public:
     bool attach_direct(const wchar_t* process_name) {
         pid = GetProcessIdByName(process_name);
         if (pid == 0) return false;
-        
-        // Open with full read access
         process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
         return process != nullptr;
     }
@@ -92,7 +90,53 @@ public:
 };
 
 // ============================================================
-// 3. GLOBAL VARIABLES & OVERLAY
+// 3. WINDOW FINDER (PID BASED)
+// ============================================================
+struct WindowData {
+    DWORD targetPid;
+    HWND hwnd;
+};
+
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    WindowData* data = (WindowData*)lParam;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    
+    if (pid == data->targetPid && IsWindowVisible(hwnd)) {
+        // Check if it has a title (filters out invisible background windows)
+        int length = GetWindowTextLengthA(hwnd);
+        if (length > 0) {
+            data->hwnd = hwnd;
+            return FALSE; // Stop enumerating
+        }
+    }
+    return TRUE;
+}
+
+HWND GetEmulatorWindow() {
+    // Find the PID of dnplayer.exe (the UI process)
+    DWORD uiPid = 0;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
+    if (Process32FirstW(snapshot, &pe)) {
+        do {
+            if (!_wcsicmp(pe.szExeFile, L"dnplayer.exe")) {
+                uiPid = pe.th32ProcessID;
+                break;
+            }
+        } while (Process32NextW(snapshot, &pe));
+    }
+    CloseHandle(snapshot);
+
+    if (uiPid == 0) return nullptr;
+
+    WindowData data = { uiPid, nullptr };
+    EnumWindows(EnumWindowsProc, (LPARAM)&data);
+    return data.hwnd;
+}
+
+// ============================================================
+// 4. GLOBAL VARIABLES & OVERLAY
 // ============================================================
 Memory mem;
 HWND overlay_window = nullptr;
@@ -146,31 +190,22 @@ void render_overlay() {
 }
 
 // ============================================================
-// 4. MAIN
+// 5. MAIN
 // ============================================================
 int main() {
     ShowWindow(GetConsoleWindow(), SW_HIDE);
 
-    // STEP 1: Enable Debug Privilege
     if (!EnableDebugPrivilege()) {
         MessageBoxA(nullptr, "Failed to elevate privileges. Run as Administrator.", "Error", MB_ICONERROR);
         return 1;
     }
 
-    // STEP 2: Try to attach to both common LDPlayer processes
     bool attached = false;
     if (mem.attach_direct(L"Ld9BoxHeadless.exe")) attached = true;
     else if (mem.attach_direct(L"LdVBoxHeadless.exe")) attached = true;
 
     if (!attached) {
-        // Get the exact Windows error code (5 = Access Denied, 87 = Invalid Parameter, 2 = Not Found)
-        DWORD err = GetLastError();
-        std::string msg = "Failed to attach to LDPlayer headless process.\n\n"
-                          "Possible reasons:\n"
-                          "1. LDPlayer 9 is not running.\n"
-                          "2. The game is not loaded.\n"
-                          "3. Windows Error Code: " + std::to_string(err);
-        MessageBoxA(nullptr, msg.c_str(), "Attachment Failed", MB_ICONERROR);
+        MessageBoxA(nullptr, "Failed to attach to LDPlayer memory. Is it running?", "Error", MB_ICONERROR);
         return 1;
     }
 
@@ -180,11 +215,11 @@ int main() {
     wc.lpszClassName = "StealthESP";
     RegisterClassA(&wc);
 
-    ld_window = FindWindowA(nullptr, "LDPlayer");
-    if (!ld_window) ld_window = FindWindowA(nullptr, "雷电模拟器");
+    // Use the new PID-based window finder
+    ld_window = GetEmulatorWindow();
     
     if (!ld_window) {
-        MessageBoxA(nullptr, "Attached to memory, but could not find the LDPlayer window.", "Error", MB_ICONERROR);
+        MessageBoxA(nullptr, "Attached to memory, but could not find the LDPlayer window.\nMake sure it is not minimized.", "Error", MB_ICONERROR);
         return 1;
     }
 

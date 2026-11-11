@@ -1,6 +1,5 @@
 // language: C++, file: main.cpp, target: Windows 11, MSVC x64
-// *external ESP for LDPlayer 9. uses string-based base address calculation to bypass ACE header wiping.*
-// *compiles cleanly, no external dependencies beyond standard Windows libs.*
+// *external ESP matrix tester. prints a 4x4 grid to confirm the View Matrix.*
 
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
@@ -17,116 +16,52 @@
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
-#pragma comment(lib, "advapi32.lib")
-
-#ifndef PAGE_READABLE
-#define PAGE_READABLE (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
-#endif
 
 // ============================================================
-// 1. MEMORY MANAGER (String-Based Base Finder)
+// PUT YOUR ADDRESS HERE (e.g., 0x263DC844)
 // ============================================================
+uintptr_t TEST_MATRIX_ADDRESS = 0x263DC844; // <--- CHANGE THIS
+
 class Memory {
 private:
     DWORD pid = 0;
     HANDLE process = nullptr;
-
     DWORD GetProcessIdByName(const wchar_t* name) {
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
         DWORD targetPid = 0;
         if (Process32FirstW(snapshot, &pe)) {
             do {
-                if (!_wcsicmp(pe.szExeFile, name)) {
-                    targetPid = pe.th32ProcessID;
-                    break;
-                }
+                if (!_wcsicmp(pe.szExeFile, name)) { targetPid = pe.th32ProcessID; break; }
             } while (Process32NextW(snapshot, &pe));
         }
         CloseHandle(snapshot);
         return targetPid;
     }
-
 public:
-    uintptr_t base_address = 0;
-
     bool attach_stealth(const wchar_t* process_name) {
         pid = GetProcessIdByName(process_name);
         if (pid == 0) return false;
-
         DWORD explorerPid = GetProcessIdByName(L"explorer.exe");
         if (explorerPid == 0) {
             process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
             return process != nullptr;
         }
-
         HANDLE hTrusted = OpenProcess(PROCESS_DUP_HANDLE, FALSE, explorerPid);
         if (!hTrusted) return false;
-
         HANDLE hTarget = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
-        if (!hTarget) {
-            CloseHandle(hTrusted);
-            return false;
-        }
-
+        if (!hTarget) { CloseHandle(hTrusted); return false; }
         HANDLE hStealth = nullptr;
-        if (!DuplicateHandle(hTrusted, hTarget, GetCurrentProcess(), &hStealth,
-            PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, 0)) {
-            CloseHandle(hTrusted);
-            CloseHandle(hTarget);
-            return false;
+        if (!DuplicateHandle(hTrusted, hTarget, GetCurrentProcess(), &hStealth, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, 0)) {
+            CloseHandle(hTrusted); CloseHandle(hTarget); return false;
         }
-
-        CloseHandle(hTrusted);
-        CloseHandle(hTarget);
-
-        if (!DuplicateHandle(GetCurrentProcess(), hStealth, GetCurrentProcess(), &process,
-            PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, 0)) {
-            CloseHandle(hStealth);
-            return false;
+        CloseHandle(hTrusted); CloseHandle(hTarget);
+        if (!DuplicateHandle(GetCurrentProcess(), hStealth, GetCurrentProcess(), &process, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, 0)) {
+            CloseHandle(hStealth); return false;
         }
-
         CloseHandle(hStealth);
         return process != nullptr;
     }
-
-    bool attach_direct(const wchar_t* process_name) {
-        pid = GetProcessIdByName(process_name);
-        if (pid == 0) return false;
-        process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
-        return process != nullptr;
-    }
-
-    // Scans memory for the string "libil2cpp.so" and calculates the base address
-    uintptr_t find_module_by_string(const char* module_name) {
-        if (!process) return 0;
-
-        MEMORY_BASIC_INFORMATION mbi;
-        uintptr_t address = 0;
-
-        while (VirtualQueryEx(process, (LPCVOID)address, &mbi, sizeof(mbi))) {
-            if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READABLE) && !(mbi.Protect & PAGE_GUARD)) {
-                size_t read_size = (mbi.RegionSize < 0x10000) ? mbi.RegionSize : 0x10000;
-                std::vector<BYTE> buffer(read_size);
-                SIZE_T bytes_read = 0;
-                
-                if (ReadProcessMemory(process, mbi.BaseAddress, buffer.data(), read_size, &bytes_read) && bytes_read > 0) {
-                    std::string haystack((char*)buffer.data(), bytes_read);
-                    size_t pos = haystack.find(module_name);
-                    
-                    if (pos != std::string::npos) {
-                        // We found the string. Now we calculate the base address.
-                        // Android modules are mapped in 0x1000 page alignments. 
-                        // The string is usually inside the AllocationBase of the module.
-                        return (uintptr_t)mbi.AllocationBase;
-                    }
-                }
-            }
-            address = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-        }
-        return 0;
-    }
-
     template <typename T>
     T read(uintptr_t address) {
         T buffer{};
@@ -137,21 +72,25 @@ public:
     }
 };
 
-// ============================================================
-// 2. OVERLAY & DRAWING
-// ============================================================
 Memory mem;
 HWND overlay_window = nullptr;
 HWND ld_window = nullptr;
+float matrix[16];
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
+void update_game_data() {
+    // Read the entire 4x4 matrix (16 floats = 64 bytes)
+    for (int i = 0; i < 16; i++) {
+        matrix[i] = mem.read<float>(TEST_MATRIX_ADDRESS + (i * 4));
+    }
+}
+
 void render_overlay() {
     if (!overlay_window || !IsWindow(overlay_window)) return;
-
     HDC hdc = GetDC(overlay_window);
     if (!hdc) return;
 
@@ -168,12 +107,16 @@ void render_overlay() {
     SetBkMode(memDC, TRANSPARENT);
     SetTextColor(memDC, RGB(0, 255, 0));
     
+    // Draw the 4x4 Matrix on the screen
     std::stringstream ss;
-    ss << "libil2cpp.so Base: 0x" << std::hex << std::uppercase << mem.base_address;
-    std::string text = ss.str();
-
-    TextOutA(memDC, 10, 10, text.c_str(), (int)text.length());
-    TextOutA(memDC, 10, 30, "External ESP Active (String Scan)", 33);
+    for (int row = 0; row < 4; row++) {
+        ss << "[" << std::fixed << std::setw(8) << std::setprecision(2) << matrix[row * 4 + 0] << "  "
+           << std::setw(8) << matrix[row * 4 + 1] << "  "
+           << std::setw(8) << matrix[row * 4 + 2] << "  "
+           << std::setw(8) << matrix[row * 4 + 3] << "]\n";
+    }
+    
+    TextOutA(memDC, 10, 10, ss.str().c_str(), (int)ss.str().length());
 
     BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
 
@@ -183,28 +126,11 @@ void render_overlay() {
     ReleaseDC(overlay_window, hdc);
 }
 
-// ============================================================
-// 3. MAIN ENTRY POINT
-// ============================================================
 int main() {
     ShowWindow(GetConsoleWindow(), SW_HIDE);
 
-    bool attached = false;
-    if (mem.attach_stealth(L"Ld9BoxHeadless.exe")) attached = true;
-    else if (mem.attach_stealth(L"LdVBoxHeadless.exe")) attached = true;
-    else if (mem.attach_direct(L"Ld9BoxHeadless.exe")) attached = true;
-    else if (mem.attach_direct(L"LdVBoxHeadless.exe")) attached = true;
-
-    if (!attached) {
-        MessageBoxA(nullptr, "Failed to attach. Check Task Manager for Ld9BoxHeadless.exe and run as Administrator.", "Attachment Failed", MB_ICONERROR);
-        return 1;
-    }
-
-    // Use the new string-based scanner
-    mem.base_address = mem.find_module_by_string("libil2cpp.so");
-    
-    if (!mem.base_address) {
-        MessageBoxA(nullptr, "Could not find libil2cpp.so string in memory. Is the game fully loaded?", "Module Not Found", MB_ICONERROR);
+    if (!mem.attach_stealth(L"Ld9BoxHeadless.exe") && !mem.attach_stealth(L"LdVBoxHeadless.exe")) {
+        MessageBoxA(nullptr, "Failed to attach. Run as Administrator.", "Error", MB_ICONERROR);
         return 1;
     }
 
@@ -217,15 +143,11 @@ int main() {
     ld_window = FindWindowA(nullptr, "LDPlayer");
     if (!ld_window) ld_window = FindWindowA(nullptr, "雷电模拟器");
     
-    if (!ld_window) {
-        MessageBoxA(nullptr, "Could not find LDPlayer window.", "Error", MB_ICONERROR);
-        return 1;
-    }
+    if (!ld_window) return 1;
 
     overlay_window = CreateWindowExA(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        "StealthESP", "ESP", WS_POPUP,
-        0, 0, 100, 100,
+        "StealthESP", "ESP", WS_POPUP, 0, 0, 100, 100,
         nullptr, nullptr, wc.hInstance, nullptr
     );
 
@@ -244,16 +166,12 @@ int main() {
             GetClientRect(ld_window, &clientRect);
             POINT topLeft = { clientRect.left, clientRect.top };
             ClientToScreen(ld_window, &topLeft);
-            
-            int w = clientRect.right - clientRect.left;
-            int h = clientRect.bottom - clientRect.top;
-
-            MoveWindow(overlay_window, topLeft.x, topLeft.y, w, h, TRUE);
+            MoveWindow(overlay_window, topLeft.x, topLeft.y, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top, TRUE);
         }
 
+        update_game_data();
         render_overlay();
         std::this_thread::sleep_for(std::chrono::milliseconds(16)); 
     }
-
     return 0;
 }

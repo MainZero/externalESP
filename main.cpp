@@ -1,5 +1,5 @@
 // language: C++, file: main.cpp, target: Windows 11, MSVC x64
-// *external ESP matrix tester. prints a 4x4 grid to confirm the View Matrix.*
+// *external ESP matrix tester with SeDebugPrivilege elevation and detailed error reporting.*
 
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
@@ -16,12 +16,45 @@
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // ============================================================
 // PUT YOUR ADDRESS HERE (e.g., 0x263DC844)
 // ============================================================
 uintptr_t TEST_MATRIX_ADDRESS = 0x263DC844; // <--- CHANGE THIS
 
+// ============================================================
+// 1. PRIVILEGE ESCALATION (THE FIX)
+// ============================================================
+bool EnableDebugPrivilege() {
+    HANDLE hToken;
+    LUID luid;
+    TOKEN_PRIVILEGES tkp;
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return false;
+
+    if (!LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid)) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    tkp.PrivilegeCount = 1;
+    tkp.Privileges[0].Luid = luid;
+    tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    if (!AdjustTokenPrivileges(hToken, FALSE, &tkp, sizeof(tkp), NULL, NULL)) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    CloseHandle(hToken);
+    return GetLastError() == ERROR_SUCCESS;
+}
+
+// ============================================================
+// 2. MEMORY MANAGER
+// ============================================================
 class Memory {
 private:
     DWORD pid = 0;
@@ -39,29 +72,15 @@ private:
         return targetPid;
     }
 public:
-    bool attach_stealth(const wchar_t* process_name) {
+    bool attach_direct(const wchar_t* process_name) {
         pid = GetProcessIdByName(process_name);
         if (pid == 0) return false;
-        DWORD explorerPid = GetProcessIdByName(L"explorer.exe");
-        if (explorerPid == 0) {
-            process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
-            return process != nullptr;
-        }
-        HANDLE hTrusted = OpenProcess(PROCESS_DUP_HANDLE, FALSE, explorerPid);
-        if (!hTrusted) return false;
-        HANDLE hTarget = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
-        if (!hTarget) { CloseHandle(hTrusted); return false; }
-        HANDLE hStealth = nullptr;
-        if (!DuplicateHandle(hTrusted, hTarget, GetCurrentProcess(), &hStealth, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, 0)) {
-            CloseHandle(hTrusted); CloseHandle(hTarget); return false;
-        }
-        CloseHandle(hTrusted); CloseHandle(hTarget);
-        if (!DuplicateHandle(GetCurrentProcess(), hStealth, GetCurrentProcess(), &process, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, 0)) {
-            CloseHandle(hStealth); return false;
-        }
-        CloseHandle(hStealth);
+        
+        // Open with full read access
+        process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
         return process != nullptr;
     }
+    
     template <typename T>
     T read(uintptr_t address) {
         T buffer{};
@@ -72,6 +91,9 @@ public:
     }
 };
 
+// ============================================================
+// 3. GLOBAL VARIABLES & OVERLAY
+// ============================================================
 Memory mem;
 HWND overlay_window = nullptr;
 HWND ld_window = nullptr;
@@ -83,7 +105,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 }
 
 void update_game_data() {
-    // Read the entire 4x4 matrix (16 floats = 64 bytes)
     for (int i = 0; i < 16; i++) {
         matrix[i] = mem.read<float>(TEST_MATRIX_ADDRESS + (i * 4));
     }
@@ -107,7 +128,6 @@ void render_overlay() {
     SetBkMode(memDC, TRANSPARENT);
     SetTextColor(memDC, RGB(0, 255, 0));
     
-    // Draw the 4x4 Matrix on the screen
     std::stringstream ss;
     for (int row = 0; row < 4; row++) {
         ss << "[" << std::fixed << std::setw(8) << std::setprecision(2) << matrix[row * 4 + 0] << "  "
@@ -117,7 +137,6 @@ void render_overlay() {
     }
     
     TextOutA(memDC, 10, 10, ss.str().c_str(), (int)ss.str().length());
-
     BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
 
     SelectObject(memDC, oldBitmap);
@@ -126,11 +145,32 @@ void render_overlay() {
     ReleaseDC(overlay_window, hdc);
 }
 
+// ============================================================
+// 4. MAIN
+// ============================================================
 int main() {
     ShowWindow(GetConsoleWindow(), SW_HIDE);
 
-    if (!mem.attach_stealth(L"Ld9BoxHeadless.exe") && !mem.attach_stealth(L"LdVBoxHeadless.exe")) {
-        MessageBoxA(nullptr, "Failed to attach. Run as Administrator.", "Error", MB_ICONERROR);
+    // STEP 1: Enable Debug Privilege
+    if (!EnableDebugPrivilege()) {
+        MessageBoxA(nullptr, "Failed to elevate privileges. Run as Administrator.", "Error", MB_ICONERROR);
+        return 1;
+    }
+
+    // STEP 2: Try to attach to both common LDPlayer processes
+    bool attached = false;
+    if (mem.attach_direct(L"Ld9BoxHeadless.exe")) attached = true;
+    else if (mem.attach_direct(L"LdVBoxHeadless.exe")) attached = true;
+
+    if (!attached) {
+        // Get the exact Windows error code (5 = Access Denied, 87 = Invalid Parameter, 2 = Not Found)
+        DWORD err = GetLastError();
+        std::string msg = "Failed to attach to LDPlayer headless process.\n\n"
+                          "Possible reasons:\n"
+                          "1. LDPlayer 9 is not running.\n"
+                          "2. The game is not loaded.\n"
+                          "3. Windows Error Code: " + std::to_string(err);
+        MessageBoxA(nullptr, msg.c_str(), "Attachment Failed", MB_ICONERROR);
         return 1;
     }
 
@@ -143,7 +183,10 @@ int main() {
     ld_window = FindWindowA(nullptr, "LDPlayer");
     if (!ld_window) ld_window = FindWindowA(nullptr, "雷电模拟器");
     
-    if (!ld_window) return 1;
+    if (!ld_window) {
+        MessageBoxA(nullptr, "Attached to memory, but could not find the LDPlayer window.", "Error", MB_ICONERROR);
+        return 1;
+    }
 
     overlay_window = CreateWindowExA(
         WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,

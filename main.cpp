@@ -1,5 +1,5 @@
 // language: C++, file: main.cpp, target: Windows 11, MSVC x64
-// *AUTOMATED EXTERNAL ESP. Finds View Matrix and Entity List automatically.*
+// *FINAL AUTOMATED EXTERNAL ESP. Scans for View Matrix AND Entity List automatically.*
 
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
@@ -74,7 +74,7 @@ public:
         return buffer;
     }
 
-    // Find View Matrix
+    // 1. Find View Matrix
     uintptr_t ScanForViewMatrix() {
         if (!process) return 0;
         MEMORY_BASIC_INFORMATION mbi; uintptr_t address = 0;
@@ -111,7 +111,7 @@ public:
         return candidates[0];
     }
 
-    // Find Entity List (Scans for an array of pointers pointing to valid objects)
+    // 2. Heuristic Entity List Scanner (Finds the array of players)
     uintptr_t ScanForEntityList() {
         if (!process) return 0;
         MEMORY_BASIC_INFORMATION mbi; uintptr_t address = 0;
@@ -120,20 +120,23 @@ public:
             if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE) && !(mbi.Protect & PAGE_GUARD)) {
                 std::vector<BYTE> buffer(mbi.RegionSize); SIZE_T bytes_read = 0;
                 if (ReadProcessMemory(process, mbi.BaseAddress, buffer.data(), mbi.RegionSize, &bytes_read)) {
-                    // Look for arrays of pointers
+                    
                     for (size_t i = 0; i <= bytes_read - (sizeof(uintptr_t) * 10); i += 8) {
                         uintptr_t* ptrArray = (uintptr_t*)&buffer[i];
                         
-                        // Check if this looks like an array of valid heap pointers
-                        if (ptrArray[0] > 0x10000 && ptrArray[1] > 0x10000 && ptrArray[2] > 0x10000) {
-                            // Check if the first pointer points to a valid Vector3 (XYZ coordinates)
-                            Vec3 pos = read<Vec3>(ptrArray[0] + 0x50); // Common offset for Unity position
+                        // Look for an array of valid pointers
+                        if (ptrArray[0] > 0x10000 && ptrArray[1] > 0x10000 && ptrArray[2] > 0x10000 &&
+                            ptrArray[0] < 0x7FFFFFFF0000 && ptrArray[1] < 0x7FFFFFFF0000) {
                             
-                            // Map bounds check (World is usually between -10000 and 10000)
-                            if (std::abs(pos.x) > 0.1f && std::abs(pos.x) < 20000.0f &&
-                                std::abs(pos.y) > 0.1f && std::abs(pos.y) < 20000.0f &&
-                                std::abs(pos.z) > 0.1f && std::abs(pos.z) < 20000.0f) {
-                                return (uintptr_t)mbi.BaseAddress + i;
+                            // Test if the first pointer points to a Vector3 at common offsets
+                            for (int offset : {0x38, 0x50, 0x60, 0x90}) {
+                                Vec3 pos = read<Vec3>(ptrArray[0] + offset);
+                                // Map bounds check (must be valid game coordinates, not junk)
+                                if (std::abs(pos.x) > 0.1f && std::abs(pos.x) < 20000.0f &&
+                                    std::abs(pos.y) > 0.1f && std::abs(pos.y) < 20000.0f &&
+                                    std::abs(pos.z) > 0.1f && std::abs(pos.z) < 20000.0f) {
+                                    return (uintptr_t)mbi.BaseAddress + i;
+                                }
                             }
                         }
                     }
@@ -164,10 +167,8 @@ HWND GetEmulatorWindow() {
 }
 
 Memory mem; HWND overlay_window = nullptr; HWND ld_window = nullptr;
-uintptr_t viewMatrixAddress = 0; 
-uintptr_t entityListAddress = 0;
-float viewMatrix[16]; 
-bool isScanning = true;
+uintptr_t viewMatrixAddress = 0; uintptr_t entityListAddress = 0;
+float viewMatrix[16]; bool isScanning = true;
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_DESTROY) { PostQuitMessage(0); return 0; }
@@ -187,7 +188,7 @@ void render_overlay() {
 
     std::stringstream ss;
     if (isScanning) {
-        ss << "SCANNING FOR MATRIX AND ENTITIES... PLEASE WAIT...";
+        ss << "SCANNING... PLEASE WAIT...";
     } else if (viewMatrixAddress == 0) {
         ss << "FAILED TO FIND VIEW MATRIX.";
     } else {
@@ -202,14 +203,16 @@ void render_overlay() {
                 uintptr_t playerPtr = mem.read<uintptr_t>(entityListAddress + (i * 8));
                 if (!playerPtr || playerPtr < 0x10000) continue;
 
-                // Try common offsets for position
-                Vec3 pos = mem.read<Vec3>(playerPtr + 0x50); 
-                if (std::abs(pos.x) < 0.1f && std::abs(pos.y) < 0.1f) pos = mem.read<Vec3>(playerPtr + 0x60); // Try another offset
+                // Try the offsets to find the position
+                Vec3 pos = {0,0,0};
+                for (int offset : {0x38, 0x50, 0x60, 0x90}) {
+                    pos = mem.read<Vec3>(playerPtr + offset);
+                    if (std::abs(pos.x) > 0.1f && std::abs(pos.x) < 20000.0f) break;
+                }
                 
                 if (std::abs(pos.x) > 0.1f && std::abs(pos.x) < 20000.0f) {
                     Vec2 screen;
                     if (WorldToScreen(pos, screen, viewMatrix, width, height)) {
-                        // Draw Box
                         HPEN pen = CreatePen(PS_SOLID, 2, RGB(255, 0, 0));
                         SelectObject(memDC, pen);
                         HGDIOBJ oldBrush = SelectObject(memDC, GetStockObject(NULL_BRUSH));
@@ -217,9 +220,7 @@ void render_overlay() {
                         SelectObject(memDC, oldBrush);
                         DeleteObject(pen);
                         
-                        // Draw Text
-                        std::stringstream pText;
-                        pText << "Enemy " << i;
+                        std::stringstream pText; pText << "Player " << i;
                         TextOutA(memDC, (int)screen.x - 20, (int)screen.y - 65, pText.str().c_str(), pText.str().length());
                     }
                 }

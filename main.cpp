@@ -1,5 +1,6 @@
 // language: C++, file: main.cpp, target: Windows 11, MSVC x64
-// *FINAL AUTOMATED EXTERNAL ESP. Scans for View Matrix AND Entity List automatically.*
+// *FINAL AUTOMATED EXTERNAL ESP for CFL (Unity 5.6.4).*
+// *Scans for View Matrix and Entity List automatically using structural heuristics.*
 
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
@@ -19,6 +20,9 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
 
+// ============================================================
+// 1. MATH & STRUCTS
+// ============================================================
 struct Vec3 { float x, y, z; };
 struct Vec2 { float x, y; };
 
@@ -38,6 +42,9 @@ bool WorldToScreen(Vec3 pos, Vec2& screen, float matrix[16], int windowWidth, in
     return true;
 }
 
+// ============================================================
+// 2. PRIVILEGE ESCALATION & MEMORY MANAGER
+// ============================================================
 bool EnableDebugPrivilege() {
     HANDLE hToken; LUID luid; TOKEN_PRIVILEGES tkp;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) return false;
@@ -51,6 +58,8 @@ bool EnableDebugPrivilege() {
 class Memory {
 public:
     DWORD pid = 0; HANDLE process = nullptr;
+    uintptr_t module_base = 0;
+    size_t module_size = 0;
 
     DWORD GetProcessIdByName(const wchar_t* name) {
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -74,7 +83,26 @@ public:
         return buffer;
     }
 
-    // 1. Find View Matrix
+    // Finds the exact address of libil2cpp.so
+    void find_libil2cpp() {
+        MEMORY_BASIC_INFORMATION mbi; uintptr_t address = 0;
+        while (VirtualQueryEx(process, (LPCVOID)address, &mbi, sizeof(mbi))) {
+            if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE) && !(mbi.Protect & PAGE_GUARD)) {
+                std::vector<BYTE> buffer(mbi.RegionSize); SIZE_T bytes_read = 0;
+                if (ReadProcessMemory(process, mbi.BaseAddress, buffer.data(), mbi.RegionSize, &bytes_read)) {
+                    std::string haystack((char*)buffer.data(), bytes_read);
+                    if (haystack.find("libil2cpp.so") != std::string::npos) {
+                        module_base = (uintptr_t)mbi.AllocationBase;
+                        module_size = mbi.RegionSize;
+                        return;
+                    }
+                }
+            }
+            address = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        }
+    }
+
+    // 1. Auto-Scan for View Matrix
     uintptr_t ScanForViewMatrix() {
         if (!process) return 0;
         MEMORY_BASIC_INFORMATION mbi; uintptr_t address = 0;
@@ -120,18 +148,18 @@ public:
             if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE) && !(mbi.Protect & PAGE_GUARD)) {
                 std::vector<BYTE> buffer(mbi.RegionSize); SIZE_T bytes_read = 0;
                 if (ReadProcessMemory(process, mbi.BaseAddress, buffer.data(), mbi.RegionSize, &bytes_read)) {
-                    
+                    // Scan for arrays of 10+ pointers
                     for (size_t i = 0; i <= bytes_read - (sizeof(uintptr_t) * 10); i += 8) {
                         uintptr_t* ptrArray = (uintptr_t*)&buffer[i];
-                        
-                        // Look for an array of valid pointers
-                        if (ptrArray[0] > 0x10000 && ptrArray[1] > 0x10000 && ptrArray[2] > 0x10000 &&
-                            ptrArray[0] < 0x7FFFFFFF0000 && ptrArray[1] < 0x7FFFFFFF0000) {
-                            
-                            // Test if the first pointer points to a Vector3 at common offsets
+                        int validCount = 0;
+                        for (int j = 0; j < 10; j++) {
+                            if (ptrArray[j] > 0x10000 && ptrArray[j] < 0x7FFFFFFF0000) validCount++;
+                        }
+
+                        // If we found a list of 10 valid pointers, check if the first one points to a valid Vector3
+                        if (validCount >= 10) {
                             for (int offset : {0x38, 0x50, 0x60, 0x90}) {
                                 Vec3 pos = read<Vec3>(ptrArray[0] + offset);
-                                // Map bounds check (must be valid game coordinates, not junk)
                                 if (std::abs(pos.x) > 0.1f && std::abs(pos.x) < 20000.0f &&
                                     std::abs(pos.y) > 0.1f && std::abs(pos.y) < 20000.0f &&
                                     std::abs(pos.z) > 0.1f && std::abs(pos.z) < 20000.0f) {
@@ -148,38 +176,33 @@ public:
     }
 };
 
-struct WindowData { DWORD targetPid; HWND hwnd; };
-BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
-    WindowData* data = (WindowData*)lParam; DWORD pid = 0; GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == data->targetPid && IsWindowVisible(hwnd)) {
-        if (GetWindowTextLengthA(hwnd) > 0) { data->hwnd = hwnd; return FALSE; }
-    }
-    return TRUE;
-}
-HWND GetEmulatorWindow() {
-    DWORD uiPid = 0; HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
-    if (Process32FirstW(snapshot, &pe)) {
-        do { if (!_wcsicmp(pe.szExeFile, L"dnplayer.exe")) { uiPid = pe.th32ProcessID; break; } } while (Process32NextW(snapshot, &pe));
-    }
-    CloseHandle(snapshot); if (uiPid == 0) return nullptr;
-    WindowData data = { uiPid, nullptr }; EnumWindows(EnumWindowsProc, (LPARAM)&data); return data.hwnd;
-}
-
+// ============================================================
+// 3. OVERLAY & RENDER
+// ============================================================
 Memory mem; HWND overlay_window = nullptr; HWND ld_window = nullptr;
 uintptr_t viewMatrixAddress = 0; uintptr_t entityListAddress = 0;
 float viewMatrix[16]; bool isScanning = true;
 
+struct WindowData { DWORD targetPid; HWND hwnd; };
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    WindowData* data = (WindowData*)lParam; DWORD pid = 0; GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == data->targetPid && IsWindowVisible(hwnd)) { if (GetWindowTextLengthA(hwnd) > 0) { data->hwnd = hwnd; return FALSE; } }
+    return TRUE;
+}
+HWND GetEmulatorWindow() {
+    DWORD uiPid = 0; HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0); PROCESSENTRY32W pe = { sizeof(PROCESSENTRY32W) };
+    if (Process32FirstW(snapshot, &pe)) { do { if (!_wcsicmp(pe.szExeFile, L"dnplayer.exe")) { uiPid = pe.th32ProcessID; break; } } while (Process32NextW(snapshot, &pe)); }
+    CloseHandle(snapshot); if (uiPid == 0) return nullptr; WindowData data = { uiPid, nullptr }; EnumWindows(EnumWindowsProc, (LPARAM)&data); return data.hwnd;
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_DESTROY) { PostQuitMessage(0); return 0; }
-    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+    if (uMsg == WM_DESTROY) { PostQuitMessage(0); return 0; } return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
 void render_overlay() {
     if (!overlay_window || !IsWindow(overlay_window)) return;
     HDC hdc = GetDC(overlay_window); if (!hdc) return;
-    RECT rect; GetClientRect(overlay_window, &rect);
-    int width = rect.right - rect.left; int height = rect.bottom - rect.top;
+    RECT rect; GetClientRect(overlay_window, &rect); int width = rect.right - rect.left; int height = rect.bottom - rect.top;
 
     HDC memDC = CreateCompatibleDC(hdc); HBITMAP memBitmap = CreateCompatibleBitmap(hdc, width, height);
     HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
@@ -187,11 +210,9 @@ void render_overlay() {
     SetBkMode(memDC, TRANSPARENT); SetTextColor(memDC, RGB(0, 255, 0));
 
     std::stringstream ss;
-    if (isScanning) {
-        ss << "SCANNING... PLEASE WAIT...";
-    } else if (viewMatrixAddress == 0) {
-        ss << "FAILED TO FIND VIEW MATRIX.";
-    } else {
+    if (isScanning) { ss << "SCANNING FOR MATRIX AND ENTITIES... PLEASE WAIT..."; }
+    else if (viewMatrixAddress == 0) { ss << "FAILED TO FIND VIEW MATRIX."; }
+    else {
         for (int i = 0; i < 16; i++) viewMatrix[i] = mem.read<float>(viewMatrixAddress + (i * 4));
         
         ss << "View Matrix: 0x" << std::hex << std::uppercase << viewMatrixAddress << "\n";
@@ -203,58 +224,50 @@ void render_overlay() {
                 uintptr_t playerPtr = mem.read<uintptr_t>(entityListAddress + (i * 8));
                 if (!playerPtr || playerPtr < 0x10000) continue;
 
-                // Try the offsets to find the position
-                Vec3 pos = {0,0,0};
+                Vec3 pos = {0,0,0}; int usedOffset = 0;
                 for (int offset : {0x38, 0x50, 0x60, 0x90}) {
                     pos = mem.read<Vec3>(playerPtr + offset);
-                    if (std::abs(pos.x) > 0.1f && std::abs(pos.x) < 20000.0f) break;
+                    if (std::abs(pos.x) > 0.1f && std::abs(pos.x) < 20000.0f) { usedOffset = offset; break; }
                 }
                 
-                if (std::abs(pos.x) > 0.1f && std::abs(pos.x) < 20000.0f) {
+                if (usedOffset != 0) {
                     Vec2 screen;
                     if (WorldToScreen(pos, screen, viewMatrix, width, height)) {
-                        HPEN pen = CreatePen(PS_SOLID, 2, RGB(255, 0, 0));
-                        SelectObject(memDC, pen);
+                        HPEN pen = CreatePen(PS_SOLID, 2, RGB(255, 0, 0)); SelectObject(memDC, pen);
                         HGDIOBJ oldBrush = SelectObject(memDC, GetStockObject(NULL_BRUSH));
                         Rectangle(memDC, (int)screen.x - 20, (int)screen.y - 50, (int)screen.x + 20, (int)screen.y + 10);
-                        SelectObject(memDC, oldBrush);
-                        DeleteObject(pen);
+                        SelectObject(memDC, oldBrush); DeleteObject(pen);
                         
-                        std::stringstream pText; pText << "Player " << i;
+                        std::stringstream pText; pText << i << ": " << (int)pos.x << "," << (int)pos.y << "," << (int)pos.z << " (Off:0x" << std::hex << usedOffset << ")";
                         TextOutA(memDC, (int)screen.x - 20, (int)screen.y - 65, pText.str().c_str(), pText.str().length());
                     }
                 }
             }
-        } else {
-            ss << "Entity List: Searching...\n";
-        }
+        } else { ss << "Entity List: Searching...\n"; }
     }
     TextOutA(memDC, 10, 10, ss.str().c_str(), (int)ss.str().length());
-
     BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
     SelectObject(memDC, oldBitmap); DeleteObject(memBitmap); DeleteDC(memDC); ReleaseDC(overlay_window, hdc);
 }
 
+// ============================================================
+// 4. MAIN
+// ============================================================
 int main() {
     ShowWindow(GetConsoleWindow(), SW_HIDE);
     if (!EnableDebugPrivilege()) return 1;
-    bool attached = false;
-    if (mem.attach_direct(L"Ld9BoxHeadless.exe")) attached = true;
-    else if (mem.attach_direct(L"LdVBoxHeadless.exe")) attached = true;
-    if (!attached) return 1;
+    if (!mem.attach_direct(L"Ld9BoxHeadless.exe") && !mem.attach_direct(L"LdVBoxHeadless.exe")) return 1;
 
     WNDCLASSA wc = { 0 }; wc.lpfnWndProc = WindowProc; wc.hInstance = GetModuleHandle(nullptr); wc.lpszClassName = "StealthESP";
-    RegisterClassA(&wc); ld_window = GetEmulatorWindow();
-    if (!ld_window) return 1;
+    RegisterClassA(&wc); ld_window = GetEmulatorWindow(); if (!ld_window) return 1;
 
     overlay_window = CreateWindowExA(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW, "StealthESP", "ESP", WS_POPUP, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
     SetLayeredWindowAttributes(overlay_window, RGB(0, 0, 0), 0, LWA_COLORKEY); ShowWindow(overlay_window, SW_SHOW);
 
     std::thread scanner([]() {
+        mem.find_libil2cpp();
         viewMatrixAddress = mem.ScanForViewMatrix();
-        if (viewMatrixAddress != 0) {
-            entityListAddress = mem.ScanForEntityList();
-        }
+        if (viewMatrixAddress != 0) entityListAddress = mem.ScanForEntityList();
         isScanning = false;
     });
     scanner.detach();
